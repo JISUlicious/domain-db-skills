@@ -22,6 +22,7 @@ that explains what the tables, columns, and coded values actually mean.
 | **Schema size** | ~3 tables initially; knowledge layer must scale but starts small |
 | **Output size** | Users expect large result sets — pagination and export are required |
 | **Portability** | Must be a simple downloadable Python skill, not a hosted service |
+| **Naming chaos** | Column names are non-descriptive, abbreviated, and called different things by different teams |
 
 ---
 
@@ -35,39 +36,37 @@ that explains what the tables, columns, and coded values actually mean.
 | G4 | Support iterative multi-step reasoning | Agent explores schema → drafts SQL → validates → refines → executes |
 | G5 | Safe execution with large-data awareness | Read-only; timeout guardrails; pagination for large results |
 | G6 | Auto-extract schema metadata | CLI tool to bootstrap knowledge YAML from `INFORMATION_SCHEMA` |
-| G7 | Framework-agnostic | Works with Claude tool_use, but adaptable to any agent framework |
+| G7 | Agent-assisted knowledge enrichment | Interactive mode where agent helps build descriptions, aliases, and coded-value mappings |
+| G8 | Resolve naming ambiguity | Match user terms (aliases, abbreviations, domain jargon) to actual column/table names |
+| G9 | Framework-agnostic | Works with Claude tool_use, but adaptable to any agent framework |
 
 ---
 
 ## 3. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Agent (LLM)                              │
-│                                                                 │
-│  1. Receive user question                                       │
-│  2. search_schema_knowledge → understand relevant tables        │
-│  3. describe_table → get EAV config, columns, join hints        │
-│  4. Generate SQL (with EAV pivoting, performance hints)         │
-│  5. validate_sql → check safety                                 │
-│  6. explain_query → verify plan on large tables                 │
-│  7. execute_query → get results (paginated)                     │
-│  8. Format & return results (or export to file)                 │
-└────────┬──────────────────┬──────────────────┬──────────────────┘
-         │                  │                  │
-         ▼                  ▼                  ▼
-┌────────────────┐ ┌────────────────┐ ┌───────────────────────┐
-│ Knowledge Layer│ │  SQL Validator  │ │  Database Executor    │
-│ (Static YAML,  │ │  & Guardrails   │ │  (read-only, pooled,  │
-│  upgradeable   │ │                 │ │   paginated results)  │
-│  to Vector DB) │ │                 │ │                       │
-└────────────────┘ └────────────────┘ └───────────────────────┘
-         ▲
-         │
-┌────────────────┐
-│ Schema Crawler  │  ← CLI: auto-extract from INFORMATION_SCHEMA
-│ (bootstrap)     │    then data team enriches descriptions
-└────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Agent (LLM)                                 │
+│                                                                      │
+│  QUERY MODE (runtime)              ENRICH MODE (setup/maintenance)   │
+│  1. Receive user question          1. Review table/column from crawl │
+│  2. search_schema_knowledge        2. Sample data, suggest desc      │
+│  3. describe_table (+ aliases)     3. Ask user for aliases           │
+│  4. Generate SQL                   4. Detect abbreviation patterns   │
+│  5. validate_sql                   5. Collect coded value meanings   │
+│  6. explain_query                  6. Write enriched YAML            │
+│  7. execute_query                                                    │
+│  8. Format & return results                                          │
+└───────┬──────────────┬──────────────┬────────────────┬───────────────┘
+        │              │              │                │
+        ▼              ▼              ▼                ▼
+┌───────────────┐ ┌──────────┐ ┌──────────────┐ ┌────────────────────┐
+│Knowledge Layer│ │   SQL    │ │  Database    │ │  Schema Crawler    │
+│(Static YAML,  │ │Validator │ │  Executor    │ │  + Enrichment CLI  │
+│ aliases,      │ │& Guard-  │ │  (read-only, │ │                    │
+│ abbreviations,│ │ rails    │ │   pooled)    │ │  db-skill crawl    │
+│ conventions)  │ │          │ │              │ │  db-skill enrich   │
+└───────────────┘ └──────────┘ └──────────────┘ └────────────────────┘
 ```
 
 ### 3.1 Knowledge Layer
@@ -88,7 +87,7 @@ are interchangeable.
 Each knowledge entry describes one database object:
 
 ```yaml
-# Example: a regular wide table
+# Example: a regular wide table with aliases
 - object_type: table
   database: warehouse
   schema: dbo
@@ -96,8 +95,16 @@ Each knowledge entry describes one database object:
   display_name: Customer Dimension
   description: >
     Master customer table. One row per customer.
+  aliases:                              # ← NEW: what people call this table
+    - customer table
+    - customers
+    - customer master
+    - customer dim
+    - cust table
+  naming_convention: >                  # ← NEW: explain the naming pattern
+    "dim_" prefix = dimension table. "customer" is the entity.
   storage_format: wide
-  row_estimate: 5_000_000           # helps agent reason about performance
+  row_estimate: 5_000_000
   partition_key: null
   tags: [customer, dimension]
 
@@ -147,7 +154,7 @@ Each knowledge entry describes one database object:
     type_discriminator: val_type    # optional column that indicates which value_column to read
   tags: [entity, properties, eav]
 
-# Example: a column description with coded values
+# Example: a column description with aliases and coded values
 - object_type: column
   database: warehouse
   schema: dbo
@@ -157,11 +164,38 @@ Each knowledge entry describes one database object:
   description: >
     Coded attribute name.
   data_type: varchar(50)
+  aliases:                              # ← NEW: all the ways people refer to this
+    - attribute code
+    - attribute type
+    - attr type
+    - attribute key
   coded_values:
     REGION: "Geographic sales region (East, West, Central, South)"
     TIER: "Customer tier (Gold, Silver, Bronze)"
     ACQ_DT: "Acquisition date (YYYY-MM-DD stored as string)"
     LTV: "Lifetime value in USD (numeric stored as string)"
+
+# Example: a column with non-descriptive name and many aliases
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: rev_amt
+  display_name: Revenue Amount
+  description: >
+    Revenue in USD for this order line. Net of discounts.
+  data_type: decimal(12,2)
+  aliases:                              # different teams call this different things
+    - revenue
+    - sales amount
+    - order amount
+    - order revenue
+    - rev
+    - amount
+    - sales
+  abbreviation_note: >                  # ← NEW: explain the naming convention
+    "rev" = revenue, "amt" = amount. This DB uses the pattern
+    {metric_abbreviation}_{unit_abbreviation} for numeric columns.
 
 # Example: a relationship / join hint
 - object_type: relationship
@@ -520,9 +554,185 @@ The crawler can flag likely-EAV tables based on:
 
 These are flagged as `storage_format: eav_suspected` for human review.
 
+### Interactive Enrichment Mode
+
+Beyond basic extraction, the crawler supports an **agent-assisted enrichment
+mode** where a user has a conversation with the agent to build richer metadata.
+
+```bash
+# Launch interactive enrichment session
+db-skill enrich \
+  --knowledge ./knowledge/auto_extracted.yaml \
+  --output ./knowledge/enriched.yaml
+```
+
+In this mode, the agent:
+
+1. **Reviews each table/column** and asks the user clarifying questions
+2. **Suggests descriptions** based on column name patterns, data types, and
+   sample values
+3. **Collects aliases** — prompts the user for all the names people use
+4. **Identifies coded values** — samples distinct values from columns and asks
+   the user what they mean
+5. **Detects naming conventions** — finds patterns like `rev_amt`, `ord_dt` and
+   asks the user to confirm the abbreviation scheme
+
+#### Example Enrichment Conversation
+
+```
+Agent: I found column `rev_amt` in `fact_orders` (decimal(12,2)).
+       Sample values: 149.99, 2500.00, 89.50
+       This looks like a monetary amount. What does this column represent?
+
+User:  That's the revenue amount for each order line, in USD.
+
+Agent: Got it. What do people usually call this column? I'll record all the
+       names so I can match them later.
+
+User:  Revenue, sales amount, order amount. Some people just say "rev" or
+       "amount". The finance team calls it "order revenue".
+
+Agent: I notice a naming pattern: "rev" = revenue, "amt" = amount.
+       Do other columns follow this {abbreviation}_{unit} pattern?
+
+User:  Yes, we also have qty for quantity, dt for date, cd for code.
+
+Agent: I'll apply that pattern across all columns. Let me show you what
+       I generated for the other columns...
+```
+
+#### Enrichment Output
+
+The enrichment session produces updated YAML with:
+- `aliases[]` filled in from user responses
+- `abbreviation_note` explaining naming conventions
+- `description` written by the agent, confirmed by the user
+- `coded_values` populated from sample data + user explanations
+- `enrichment_status: complete | partial | pending` for tracking progress
+
+#### Enrichment Tracking
+
+```yaml
+# Auto-generated enrichment status per entry
+- object_type: column
+  table: fact_orders
+  column: rev_amt
+  enrichment_status: complete       # agent + user reviewed this
+  enrichment_date: "2026-04-06"
+  enrichment_notes: >
+    Confirmed by data team. Revenue in USD, net of discounts.
+    Abbreviation pattern: rev=revenue, amt=amount.
+```
+
 ---
 
-## 8. Large Result Set Strategy
+## 8. Naming Resolution & Alias Matching
+
+A core challenge: users refer to the same column/table by many names. The
+knowledge layer must resolve these ambiguities at query time.
+
+### 8.1 Alias Fields in Knowledge Schema
+
+Every table and column entry supports:
+
+```yaml
+aliases: list[str]           # all known names for this object
+abbreviation_note: str       # explanation of abbreviation conventions
+naming_convention: str       # pattern used in this database
+```
+
+The agent's `search_schema_knowledge` matches against:
+- `table` / `column` (exact DB name)
+- `display_name`
+- All entries in `aliases[]`
+- `description` text (keyword match)
+- `tags`
+
+### 8.2 Abbreviation Pattern Registry
+
+Common abbreviation patterns are stored at the database or schema level:
+
+```yaml
+- object_type: naming_convention
+  database: warehouse
+  scope: schema              # applies to all tables in this schema
+  patterns:
+    - abbreviation: rev
+      full_name: revenue
+    - abbreviation: amt
+      full_name: amount
+    - abbreviation: qty
+      full_name: quantity
+    - abbreviation: dt
+      full_name: date
+    - abbreviation: cd
+      full_name: code
+    - abbreviation: cx
+      full_name: customer
+    - abbreviation: ord
+      full_name: order
+    - abbreviation: prod
+      full_name: product
+    - abbreviation: attr
+      full_name: attribute
+    - abbreviation: val
+      full_name: value
+    - abbreviation: num
+      full_name: number / numeric
+    - abbreviation: str
+      full_name: string
+    - abbreviation: tbl
+      full_name: table (prefix)
+    - abbreviation: dim
+      full_name: dimension (prefix)
+    - abbreviation: fact
+      full_name: fact (prefix)
+  description: >
+    This database uses abbreviated column names in the format
+    {concept_abbr}_{type_abbr}. Table prefixes indicate the table
+    type: dim_ for dimensions, fact_ for fact tables, tbl_ for
+    general/EAV tables.
+```
+
+### 8.3 Resolution Algorithm
+
+When the user says "revenue" and the column is `rev_amt`:
+
+1. **Direct match** — check column name, display_name, aliases
+2. **Abbreviation expansion** — expand "revenue" → check against known
+   abbreviations → match `rev` in `rev_amt`
+3. **Fuzzy match** — token overlap between user term and all indexed terms
+4. **Semantic match** — (future, with vector DB) embedding similarity
+
+The resolver returns **ranked candidates** with confidence scores. If ambiguous,
+the agent asks the user to clarify.
+
+### 8.4 Context-Dependent Aliases
+
+Different teams may use the same word for different things. The knowledge layer
+supports **context tags** on aliases:
+
+```yaml
+- object_type: column
+  table: fact_orders
+  column: rev_amt
+  aliases:
+    - name: revenue
+      contexts: [all]
+    - name: sales
+      contexts: [finance, executive]    # finance team says "sales"
+    - name: order amount
+      contexts: [operations]            # ops team says "order amount"
+    - name: GMV
+      contexts: [marketplace]           # marketplace team says "GMV"
+```
+
+When the user's context is known (e.g. "I'm from the finance team"), the
+resolver prioritizes context-specific aliases.
+
+---
+
+## 9. Large Result Set Strategy (unchanged from prior revision)
 
 Given that users expect large data output (10k+ rows), the skill needs to
 handle results that don't fit in a single LLM context window.
@@ -541,7 +751,7 @@ The agent should default to **summary + export** for large results:
 
 ---
 
-## 9. Configuration
+## 10. Configuration
 
 ```yaml
 # config.yaml
@@ -591,7 +801,7 @@ export:
 
 ---
 
-## 10. Security Considerations
+## 11. Security Considerations
 
 | Concern | Mitigation |
 |---------|------------|
@@ -604,7 +814,7 @@ export:
 
 ---
 
-## 11. Tool Registration Format
+## 12. Tool Registration Format
 
 The skill exports tools in a **framework-agnostic JSON schema** format.
 Thin adapters translate this to framework-specific formats.
@@ -626,7 +836,7 @@ openai_tools = skill.get_tools(format="openai")   # OpenAI function format
 
 ---
 
-## 12. Non-Goals (v0.1)
+## 13. Non-Goals (v0.1)
 
 - **Write operations** — this skill is read-only
 - **Cross-database joins** — single database per skill instance
