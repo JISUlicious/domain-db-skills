@@ -1,0 +1,171 @@
+# Example knowledge base for a customer data warehouse
+# Copy and adapt this for your own database schema.
+
+# --- Tables ---
+
+- object_type: table
+  database: warehouse
+  schema: dbo
+  table: dim_customer
+  display_name: Customer Dimension
+  description: >
+    Master customer table. One row per customer. Contains basic customer
+    info like name and email. Primary key is 'id'.
+  storage_format: wide
+  tags: [customer, dimension]
+
+- object_type: table
+  database: warehouse
+  schema: dbo
+  table: tbl_cx_attr
+  display_name: Customer Attributes (EAV)
+  description: >
+    Entity-Attribute-Value table storing customer-level attributes.
+    Each row represents one attribute for one customer. Use conditional
+    aggregation (CASE WHEN) or self-joins to pivot into wide format.
+    Join to dim_customer on cust_id = dim_customer.id.
+  storage_format: eav
+  eav_config:
+    entity_column: cust_id
+    attribute_column: attr_cd
+    value_column: attr_val
+  tags: [customer, attributes, eav]
+
+- object_type: table
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  display_name: Orders Fact
+  description: >
+    Transactional orders table. One row per order line. Contains order
+    date (ord_dt), product code (prod_cd), quantity (qty), and revenue
+    (rev_amt). Foreign key cust_id references dim_customer.id.
+  storage_format: wide
+  tags: [orders, fact, transactional]
+
+# --- Columns ---
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: dim_customer
+  column: id
+  display_name: Customer ID
+  description: "Primary key. Integer customer identifier."
+  data_type: integer
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: dim_customer
+  column: cust_name
+  display_name: Customer Name
+  description: "Full name of the customer."
+  data_type: varchar(200)
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_cx_attr
+  column: attr_cd
+  display_name: Attribute Code
+  description: >
+    Coded attribute name. Known values listed below.
+  data_type: varchar(50)
+  coded_values:
+    REGION: "Geographic sales region (East, West, Central, South)"
+    TIER: "Customer tier (Gold, Silver, Bronze)"
+    ACQ_DT: "Customer acquisition date (YYYY-MM-DD stored as string)"
+    LTV: "Customer lifetime value in USD (numeric stored as string)"
+    INDUSTRY: "Industry vertical of the customer"
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_cx_attr
+  column: attr_val
+  display_name: Attribute Value
+  description: >
+    The value for the attribute identified by attr_cd. Always stored as
+    varchar — cast as needed for numeric or date operations.
+  data_type: varchar(500)
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: ord_dt
+  display_name: Order Date
+  description: "Date the order was placed. Format: DATE (YYYY-MM-DD)."
+  data_type: date
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: rev_amt
+  display_name: Revenue Amount
+  description: "Revenue in USD for this order line."
+  data_type: decimal(12,2)
+
+# --- Relationships ---
+
+- object_type: relationship
+  description: "Customer attributes belong to a customer"
+  from_table: tbl_cx_attr
+  from_column: cust_id
+  to_table: dim_customer
+  to_column: id
+  join_type: many-to-one
+
+- object_type: relationship
+  description: "Orders belong to a customer"
+  from_table: fact_orders
+  from_column: cust_id
+  to_table: dim_customer
+  to_column: id
+  join_type: many-to-one
+
+# --- Query Patterns ---
+
+- object_type: query_pattern
+  description: "Count of Gold-tier customers by region"
+  sql_template: |
+    SELECT
+      r.attr_val AS region,
+      COUNT(DISTINCT t.cust_id) AS gold_customer_count
+    FROM tbl_cx_attr t
+    JOIN tbl_cx_attr r ON r.cust_id = t.cust_id AND r.attr_cd = 'REGION'
+    WHERE t.attr_cd = 'TIER' AND t.attr_val = 'Gold'
+    GROUP BY r.attr_val
+    ORDER BY gold_customer_count DESC
+  tags: [customer, tier, region, eav]
+
+- object_type: query_pattern
+  description: "Total revenue per customer with their tier and region"
+  sql_template: |
+    SELECT
+      c.cust_name,
+      MAX(CASE WHEN a.attr_cd = 'TIER' THEN a.attr_val END) AS tier,
+      MAX(CASE WHEN a.attr_cd = 'REGION' THEN a.attr_val END) AS region,
+      SUM(o.rev_amt) AS total_revenue
+    FROM dim_customer c
+    JOIN tbl_cx_attr a ON a.cust_id = c.id
+    JOIN fact_orders o ON o.cust_id = c.id
+    WHERE a.attr_cd IN ('TIER', 'REGION')
+    GROUP BY c.id, c.cust_name
+    ORDER BY total_revenue DESC
+  tags: [customer, revenue, tier, region, eav, join]
+
+- object_type: query_pattern
+  description: "Customers acquired in a specific year"
+  sql_template: |
+    SELECT
+      c.cust_name,
+      a.attr_val AS acquisition_date
+    FROM dim_customer c
+    JOIN tbl_cx_attr a ON a.cust_id = c.id
+    WHERE a.attr_cd = 'ACQ_DT'
+      AND a.attr_val LIKE '2024%'
+    ORDER BY a.attr_val
+  tags: [customer, acquisition, eav]

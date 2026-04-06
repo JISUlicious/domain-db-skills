@@ -1,0 +1,34 @@
+skill:
+  name: database-query
+  version: "0.1.0"
+
+knowledge:
+  provider: static_asset       # "vector_db" | "static_asset"
+
+  vector_db:
+    engine: chromadb
+    collection: schema_knowledge
+    embedding_model: text-embedding-3-small
+    host: localhost
+    port: 8000
+
+  static_asset:
+    path: ./knowledge/
+
+database:
+  engine: postgresql           # postgresql | mysql | sqlserver | sqlite
+  host: localhost
+  port: 5432
+  database: warehouse
+  user: readonly_agent
+  password_env: DB_PASSWORD    # reads password from this env var
+  connect_timeout: 10
+  query_timeout: 30
+
+guardrails:
+  max_row_limit: 10000
+  default_row_limit: 1000
+  allowed_statements: [SELECT]
+  blocked_tables: []
+  allowed_tables: []
+  max_query_length: 10000
