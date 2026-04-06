@@ -1,288 +1,391 @@
 # Database Query Agent Skill — Implementation Plan
 
-## Phase 0: Project Scaffolding
+## Design Decisions (from clarification)
 
-**Goal:** Set up the repo, tooling, and project skeleton.
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Knowledge backend | Static YAML first | ~3 tables now; simple; version-controlled; vector DB is a future upgrade |
+| Database engine | PostgreSQL primary, SQLite for tests | Postgres is the production DB; SQLite enables zero-dependency testing |
+| EAV handling | Support multiple EAV variants | Various EAV patterns in use (single_value, typed_values, multi_value) |
+| Agent reasoning | Multi-step (explore → draft → validate → execute) | Messy schemas need iterative discovery, not single-shot SQL generation |
+| Result handling | Pagination + CSV export | Users expect large outputs (10k+ rows); can't fit in LLM context |
+| Framework target | Framework-agnostic with format adapters | Primary: Claude tool_use. Also supports OpenAI, LangChain formats |
+| Packaging | Simple Python library (`pip install`) | Download and use; no server deployment |
+| Schema bootstrap | CLI crawler from INFORMATION_SCHEMA | Data team enriches auto-extracted YAML with descriptions |
+| SQL execution | Yes, read-only | Skill both generates and executes SQL |
 
-### Tasks
+---
 
-- [ ] Initialize Python project with `pyproject.toml` (Python 3.11+)
-- [ ] Set up directory structure (see below)
-- [ ] Add `.gitignore`, `README.md`
-- [ ] Configure dev dependencies: `pytest`, `ruff`, `mypy`
-- [ ] Add `Makefile` with `lint`, `test`, `format` targets
+## Phase 0: Project Scaffolding ✅
+
+Already completed. Project structure, pyproject.toml, Makefile in place.
+
+---
+
+## Phase 1: Data Models & Knowledge Layer
+
+**Goal:** Define all data models and build the static YAML knowledge provider.
 
 ### Directory Structure
 
 ```
-domain-db-skills/
-├── pyproject.toml
-├── Makefile
-├── README.md
-├── SPEC.md
-├── PLAN.md
-├── config.example.yaml
-│
-├── src/
-│   └── db_skill/
-│       ├── __init__.py
-│       ├── skill.py                # Top-level skill entry point (tool definitions)
-│       │
-│       ├── knowledge/              # Knowledge layer
-│       │   ├── __init__.py
-│       │   ├── provider.py         # KnowledgeProvider ABC
-│       │   ├── vector_provider.py  # Vector DB implementation
-│       │   ├── static_provider.py  # Static YAML/JSON implementation
-│       │   └── models.py           # KnowledgeEntry, TableSummary, etc.
-│       │
-│       ├── database/               # Database execution layer
-│       │   ├── __init__.py
-│       │   ├── executor.py         # DatabaseExecutor ABC + factory
-│       │   ├── adapters/           # DB-specific adapters
-│       │   │   ├── __init__.py
-│       │   │   ├── postgresql.py
-│       │   │   ├── mysql.py
-│       │   │   ├── sqlserver.py
-│       │   │   └── sqlite.py
-│       │   └── result.py           # QueryResult model
-│       │
-│       ├── validation/             # SQL validation & guardrails
-│       │   ├── __init__.py
-│       │   ├── validator.py        # SQL validator
-│       │   └── guardrails.py       # Guardrail rules (row limits, statement types, etc.)
-│       │
-│       └── config.py               # Configuration loading
-│
-├── knowledge/                      # Default knowledge asset directory
-│   └── example_schema.yaml         # Example knowledge entries
-│
-└── tests/
-    ├── conftest.py
-    ├── test_knowledge/
-    │   ├── test_static_provider.py
-    │   └── test_vector_provider.py
-    ├── test_database/
-    │   ├── test_executor.py
-    │   └── test_adapters.py
-    ├── test_validation/
-    │   ├── test_validator.py
-    │   └── test_guardrails.py
-    └── test_skill.py               # Integration tests for the full skill
+src/db_skill/knowledge/
+├── __init__.py
+├── models.py           # All Pydantic models
+├── provider.py         # KnowledgeProvider ABC
+└── static_provider.py  # Static YAML implementation
 ```
 
----
+### Step 1.1 — Pydantic Models (`knowledge/models.py`)
 
-## Phase 1: Knowledge Layer
+- [ ] **EAV configuration models:**
+  - `ValueColumn` — name, type, description
+  - `EAVConfig` — variant (single_value | typed_values | multi_value), entity_column, attribute_column, value_columns[], type_discriminator?
+- [ ] **Knowledge entry models:**
+  - `KnowledgeEntry` (base) — object_type, database, schema, table, description, tags
+  - `TableEntry` — storage_format, eav_config?, row_estimate?, partition_key?
+  - `ColumnEntry` — column, data_type, display_name, coded_values?
+  - `RelationshipEntry` — from_table, from_column, to_table, to_column, join_type
+  - `QueryPatternEntry` — sql_template, tags
+  - `PerformanceHintEntry` — table, indexes[], description
+- [ ] **Output models (returned by tools):**
+  - `TableSummary` — name, display_name, description, storage_format, row_estimate
+  - `TableDescription` — full metadata for describe_table output
+  - `ColumnDetail` — name, display_name, data_type, description, coded_values
+- [ ] **Query result models:**
+  - `QueryResult` — columns, rows, row_count, has_more, execution_time_ms
+  - `ExportResult` — file_path, row_count, execution_time_ms
+  - `ValidationResult` — valid, errors, warnings, tables_referenced
+  - `ExplainResult` — plan, warnings
 
-**Goal:** Build the schema knowledge retrieval system.
+### Step 1.2 — Provider Interface (`knowledge/provider.py`)
 
-### Step 1.1 — Data Models
+- [ ] Define `KnowledgeProvider` ABC:
+  ```python
+  class KnowledgeProvider(ABC):
+      def load(self) -> None: ...
+      def search(self, query: str, filters: dict | None, top_k: int = 10) -> list[KnowledgeEntry]: ...
+      def list_tables(self, database: str | None, schema: str | None, name_pattern: str | None) -> list[TableSummary]: ...
+      def describe_table(self, qualified_name: str) -> TableDescription: ...
+  ```
 
-- [ ] Define Pydantic models in `knowledge/models.py`:
-  - `KnowledgeEntry` (base: object_type, database, schema, table, description, tags)
-  - `TableEntry(KnowledgeEntry)` — adds storage_format, eav_config
-  - `ColumnEntry(KnowledgeEntry)` — adds column, data_type, coded_values
-  - `RelationshipEntry(KnowledgeEntry)` — adds from/to table/column, join_type
-  - `QueryPatternEntry(KnowledgeEntry)` — adds sql_template
-  - `EAVConfig` — entity_column, attribute_column, value_column
-  - `TableSummary`, `ColumnDetail` (output models for `describe_table`)
+### Step 1.3 — Static YAML Provider (`knowledge/static_provider.py`)
 
-### Step 1.2 — Provider Interface
+- [ ] Load all YAML files from configured directory
+- [ ] Parse into typed KnowledgeEntry subclasses via discriminated union
+- [ ] Build in-memory indexes:
+  - By object_type (for fast list_tables)
+  - By qualified table name (for fast describe_table)
+  - By tags (for search filtering)
+- [ ] Implement `search()` with keyword matching:
+  - Tokenize query
+  - Score entries by keyword overlap in description + display_name + tags
+  - Filter by metadata if filters provided
+  - Return top_k ranked results
+- [ ] Implement `list_tables()` — direct index lookup with optional filters
+- [ ] Implement `describe_table()` — aggregate table + columns + relationships + hints + patterns
 
-- [ ] Define `KnowledgeProvider` ABC in `knowledge/provider.py`:
-  - `search(query, filters, top_k) → list[KnowledgeEntry]`
-  - `list_tables(database, schema, name_pattern) → list[TableSummary]`
-  - `describe_table(qualified_name) → TableDescription`
-  - `load()` — initialize/connect
+### Step 1.4 — Tests
 
-### Step 1.3 — Static Asset Provider
-
-- [ ] Implement `StaticKnowledgeProvider` in `knowledge/static_provider.py`:
-  - Reads YAML files from a directory
-  - Indexes entries in memory
-  - `search()` uses simple keyword/tag matching (TF-IDF or fuzzy match)
-  - `list_tables()` / `describe_table()` are direct lookups
-- [ ] Write tests with fixture YAML files
-
-### Step 1.4 — Vector DB Provider
-
-- [ ] Implement `VectorKnowledgeProvider` in `knowledge/vector_provider.py`:
-  - Connects to ChromaDB (default) via client library
-  - `search()` → vector similarity search on description embeddings + metadata filters
-  - `list_tables()` → metadata filter on object_type=table
-  - `describe_table()` → metadata filter on specific table
-  - Embedding generation via configurable model (OpenAI, local, etc.)
-- [ ] Write tests with ChromaDB in-memory mode
-
-### Deliverables
-- Working knowledge retrieval from both YAML files and vector DB
-- 100% test coverage on knowledge layer
+- [ ] Test model parsing from YAML (all entry types, all EAV variants)
+- [ ] Test static provider search (keyword matching, filtering, ranking)
+- [ ] Test describe_table assembles full metadata correctly
+- [ ] Edge cases: missing optional fields, unknown object_type, empty knowledge base
 
 ---
 
 ## Phase 2: SQL Validation & Guardrails
 
-**Goal:** Ensure generated SQL is safe before execution.
+**Goal:** Parse, validate, and enforce safety rules on generated SQL.
 
-### Step 2.1 — SQL Parser Integration
+### Directory Structure
 
-- [ ] Integrate `sqlglot` for SQL parsing (supports multiple dialects)
-- [ ] Implement `SQLValidator` in `validation/validator.py`:
-  - Parse SQL string into AST
-  - Check statement type is SELECT
-  - Detect subqueries with non-SELECT statements
-  - Check referenced tables against allow/deny lists
-  - Check for dangerous patterns (e.g., `INTO OUTFILE`, `LOAD DATA`)
+```
+src/db_skill/validation/
+├── __init__.py
+├── validator.py        # SQL parsing + statement type checking
+└── guardrails.py       # Limit injection, cost warnings, audit
+```
 
-### Step 2.2 — Guardrails
+### Step 2.1 — SQL Validator (`validation/validator.py`)
 
-- [ ] Implement `Guardrails` in `validation/guardrails.py`:
-  - Inject `LIMIT` if missing (dialect-aware: `LIMIT` vs `TOP`)
-  - Enforce max query length
-  - Log all queries for audit
-  - Return structured validation result: `{valid, errors, warnings}`
+- [ ] Integrate `sqlglot` for parsing (set dialect from config: postgres default)
+- [ ] `validate(sql, dialect) -> ValidationResult`:
+  - Parse SQL into AST
+  - Reject if not a SELECT (including inside CTEs, subqueries)
+  - Extract referenced table names → check against allow/deny lists
+  - Detect dangerous patterns: `INTO OUTFILE`, `LOAD DATA`, `pg_sleep`, etc.
+  - Return `{valid, errors, warnings, tables_referenced}`
 
-### Deliverables
-- SQL validation catches all disallowed operations
-- Automatic LIMIT injection works across PostgreSQL, MySQL, SQL Server, SQLite dialects
-- Tests covering edge cases (CTEs, subqueries, UNION, etc.)
+### Step 2.2 — Guardrails (`validation/guardrails.py`)
+
+- [ ] `apply_guardrails(sql, config) -> tuple[str, list[str]]`:
+  - If no LIMIT present, inject `LIMIT {default_row_limit}` (dialect-aware)
+  - If LIMIT exceeds max_row_limit, cap it and add warning
+  - Check query length against max_query_length
+  - Return (modified_sql, warnings)
+- [ ] Dialect awareness: PostgreSQL uses `LIMIT`, SQL Server uses `TOP`
+
+### Step 2.3 — Tests
+
+- [ ] Valid SELECT queries pass
+- [ ] INSERT/UPDATE/DELETE/DROP rejected
+- [ ] CTEs with SELECT pass, CTEs with INSERT rejected
+- [ ] UNION queries handled
+- [ ] LIMIT injection works when missing
+- [ ] LIMIT capping works when too high
+- [ ] Table allowlist/denylist enforcement
+- [ ] Dangerous patterns caught (pg_sleep, INTO OUTFILE, etc.)
 
 ---
 
 ## Phase 3: Database Executor
 
-**Goal:** Execute validated queries safely against real databases.
+**Goal:** Execute validated SQL safely with pagination and export.
 
-### Step 3.1 — Executor Interface
+### Directory Structure
 
-- [ ] Define `DatabaseExecutor` ABC in `database/executor.py`:
-  - `connect()` / `disconnect()`
-  - `execute(sql, params, row_limit, timeout) → QueryResult`
-- [ ] Define `QueryResult` model: columns, rows, row_count, truncated, execution_time_ms
+```
+src/db_skill/database/
+├── __init__.py
+├── executor.py         # DatabaseExecutor ABC + factory
+├── result.py           # QueryResult, ExportResult (or reuse from models.py)
+└── adapters/
+    ├── __init__.py
+    ├── postgresql.py   # Primary: psycopg-based
+    └── sqlite.py       # For testing
+```
 
-### Step 3.2 — Adapters
+### Step 3.1 — Executor Interface (`database/executor.py`)
 
-- [ ] **PostgreSQL adapter** (`asyncpg` or `psycopg`) — primary target
-- [ ] **SQLite adapter** — for testing and lightweight use
-- [ ] MySQL adapter (stretch)
-- [ ] SQL Server adapter (stretch)
+- [ ] `DatabaseExecutor` ABC:
+  ```python
+  class DatabaseExecutor(ABC):
+      async def connect(self) -> None: ...
+      async def disconnect(self) -> None: ...
+      async def execute(self, sql: str, params: dict | None,
+                        row_limit: int, offset: int) -> QueryResult: ...
+      async def explain(self, sql: str) -> ExplainResult: ...
+      async def export_csv(self, sql: str, params: dict | None,
+                           file_path: str, max_rows: int) -> ExportResult: ...
+      async def sample_rows(self, table: str, where: str | None,
+                            limit: int) -> QueryResult: ...
+  ```
+- [ ] Factory function: `create_executor(config) -> DatabaseExecutor`
 
-### Step 3.3 — Connection Management
+### Step 3.2 — PostgreSQL Adapter (`database/adapters/postgresql.py`)
 
-- [ ] Connection pooling (async pool for PostgreSQL)
-- [ ] Read-only enforcement at connection level (`SET TRANSACTION READ ONLY`)
-- [ ] Query timeout enforcement at connection level
-- [ ] Graceful error handling: connection failures, query errors, timeouts
+- [ ] Connection using `psycopg` (sync) or `psycopg` async
+- [ ] Connection pooling via `psycopg_pool`
+- [ ] Read-only enforcement: `SET default_transaction_read_only = on`
+- [ ] Query timeout: `SET statement_timeout = {ms}`
+- [ ] `execute()`: run query, fetch rows up to limit, report has_more
+- [ ] `explain()`: run `EXPLAIN (FORMAT TEXT)` — NOT `EXPLAIN ANALYZE`
+- [ ] `export_csv()`: use server-side cursor, stream rows to CSV writer
+- [ ] `sample_rows()`: `SELECT * FROM {table} WHERE {where} LIMIT {limit}`
+  - Table name validated against knowledge layer to prevent injection
 
-### Deliverables
-- Working query execution against PostgreSQL and SQLite
-- Timeout and row-limit enforcement
-- Connection pool with auto-reconnect
+### Step 3.3 — SQLite Adapter (`database/adapters/sqlite.py`)
 
----
+- [ ] Lightweight adapter using Python's built-in `sqlite3`
+- [ ] Same interface as PostgreSQL adapter
+- [ ] Primary use: integration testing without a DB server
 
-## Phase 4: Skill Entry Point & Tool Definitions
+### Step 3.4 — Tests
 
-**Goal:** Wire everything together into a coherent agent skill.
-
-### Step 4.1 — Configuration
-
-- [ ] Implement `config.py` — load from YAML, environment variables, defaults
-- [ ] Validate config on startup
-
-### Step 4.2 — Skill Class
-
-- [ ] Implement `DatabaseQuerySkill` in `skill.py`:
-  - Constructor: accepts config, initializes knowledge provider + executor + validator
-  - Exposes 5 tool methods matching the spec:
-    1. `search_schema_knowledge(query, filters, top_k)`
-    2. `list_tables(database, schema, name_pattern)`
-    3. `describe_table(table)`
-    4. `validate_sql(sql)`
-    5. `execute_query(sql, params, row_limit)`
-  - Each method returns structured JSON-serializable output
-
-### Step 4.3 — Tool Registration
-
-- [ ] Create tool descriptors (name, description, input schema, output schema) for each method
-- [ ] Export a `get_tools()` function that returns the tool list for agent frameworks
-- [ ] Ensure compatibility with common agent frameworks (Claude tool_use format, OpenAI function calling, LangChain tools)
-
-### Deliverables
-- Single `DatabaseQuerySkill` class that can be instantiated with config
-- `get_tools()` returns agent-ready tool definitions
-- End-to-end test: question → knowledge search → SQL generation → validation → execution → result
+- [ ] Test execute with SQLite (inline results, pagination via offset)
+- [ ] Test explain output parsing
+- [ ] Test CSV export (write to temp file, verify contents)
+- [ ] Test timeout enforcement
+- [ ] Test read-only enforcement (reject INSERT etc. at DB level)
+- [ ] Test sample_rows
 
 ---
 
-## Phase 5: Testing & Documentation
+## Phase 4: Configuration & Skill Entry Point
 
-### Step 5.1 — Integration Tests
+**Goal:** Wire everything together into a single `DatabaseQuerySkill` class.
 
-- [ ] Set up SQLite-based integration tests (no external DB required)
-- [ ] Create test fixtures: sample EAV tables + knowledge entries
-- [ ] Test full flow: knowledge lookup → SQL gen → validate → execute
-- [ ] Test EAV pivot scenarios specifically
+### Step 4.1 — Configuration (`config.py`)
 
-### Step 5.2 — Example Knowledge Base
+- [ ] Pydantic settings model:
+  ```python
+  class SkillConfig(BaseModel):
+      knowledge: KnowledgeConfig
+      database: DatabaseConfig
+      guardrails: GuardrailsConfig
+      export: ExportConfig
+  ```
+- [ ] Load from YAML file path
+- [ ] Override individual fields from environment variables
+- [ ] Validate on construction
 
-- [ ] Write example knowledge YAML covering:
-  - 2-3 regular (wide) tables
-  - 1-2 EAV tables with coded values
-  - Relationships between them
-  - 3-5 query patterns
-- [ ] This doubles as documentation and a template for users
+### Step 4.2 — Skill Class (`skill.py`)
 
-### Step 5.3 — Documentation
+- [ ] `DatabaseQuerySkill` — main entry point:
+  ```python
+  class DatabaseQuerySkill:
+      @classmethod
+      def from_config(cls, config_path: str) -> "DatabaseQuerySkill": ...
 
-- [ ] `README.md` — quick start, configuration, usage
-- [ ] Inline docstrings on public interfaces
-- [ ] `knowledge/README.md` — how to write knowledge entries
+      # 7 tools matching the spec
+      def search_schema_knowledge(self, query, filters, top_k) -> dict: ...
+      def list_tables(self, database, schema, name_pattern) -> dict: ...
+      def describe_table(self, table) -> dict: ...
+      def validate_sql(self, sql, dialect) -> dict: ...
+      def explain_query(self, sql) -> dict: ...
+      def execute_query(self, sql, params, row_limit, offset, export_format) -> dict: ...
+      def get_sample_rows(self, table, where, limit) -> dict: ...
+
+      # Tool registration
+      def get_tools(self, format="generic") -> list[dict]: ...
+      def call(self, tool_name: str, arguments: dict) -> dict: ...
+  ```
+- [ ] Each method returns JSON-serializable dict
+- [ ] `call()` dispatches by tool name (for agent framework integration)
+
+### Step 4.3 — Tool Registration & Format Adapters
+
+- [ ] Generic format: JSON Schema for input, description string
+- [ ] Claude format adapter: `{"name", "description", "input_schema"}`
+- [ ] OpenAI format adapter: `{"type": "function", "function": {"name", "description", "parameters"}}`
+- [ ] Each tool includes a detailed description telling the agent **when and why** to use it
+
+### Step 4.4 — Tests
+
+- [ ] Test from_config loads correctly
+- [ ] Test each tool method independently
+- [ ] End-to-end: search → describe → validate → execute against SQLite
+- [ ] Test get_tools returns valid schemas for each format
 
 ---
 
-## Phase Summary & Priority Order
+## Phase 5: Schema Crawler CLI
 
-| Phase | Priority | Estimated Effort | Dependencies |
-|-------|----------|-----------------|--------------|
-| Phase 0: Scaffolding | P0 | Small | None |
-| Phase 1: Knowledge Layer | P0 | Medium | Phase 0 |
-| Phase 2: SQL Validation | P0 | Medium | Phase 0 |
-| Phase 3: Database Executor | P0 | Medium | Phase 0 |
-| Phase 4: Skill Entry Point | P0 | Medium | Phases 1-3 |
-| Phase 5: Testing & Docs | P1 | Medium | Phase 4 |
+**Goal:** Auto-extract schema metadata from a live database into knowledge YAML.
 
-Phases 1, 2, and 3 are independent and can be worked on in parallel.
-Phase 4 integrates them. Phase 5 hardens the result.
+### Directory Structure
+
+```
+src/db_skill/
+├── ...
+└── crawler/
+    ├── __init__.py
+    ├── cli.py              # CLI entry point
+    ├── extractor.py        # INFORMATION_SCHEMA queries
+    └── eav_detector.py     # Heuristic EAV detection
+```
+
+### Step 5.1 — Schema Extractor (`crawler/extractor.py`)
+
+- [ ] Query `information_schema.tables` → table names, row estimates
+- [ ] Query `information_schema.columns` → column names, types, nullability
+- [ ] Query `information_schema.table_constraints` + `key_column_usage` → PKs, FKs
+- [ ] Query `pg_indexes` or `information_schema` equivalent → index info
+- [ ] For PostgreSQL: `pg_stat_user_tables` for row count estimates
+- [ ] Output: list of TableEntry + ColumnEntry + RelationshipEntry with empty descriptions
+
+### Step 5.2 — EAV Detector (`crawler/eav_detector.py`)
+
+- [ ] Heuristic rules:
+  - Table has 3-6 columns
+  - One column is varchar with name matching `*val*`, `*value*`
+  - One column is varchar with name matching `*key*`, `*attr*`, `*code*`, `*type*`, `*prop*`
+  - One column looks like an FK (integer/bigint, name ending in `_id`)
+- [ ] Flag matching tables as `storage_format: eav_suspected`
+- [ ] Best-guess `eav_config` based on column name heuristics
+
+### Step 5.3 — CLI (`crawler/cli.py`)
+
+- [ ] `db-skill crawl` command:
+  - `--engine`, `--host`, `--port`, `--database`, `--schema`, `--user`
+  - `--output` path for YAML
+  - `--detect-eav` flag (default on)
+- [ ] Output well-formatted YAML with `# TODO: add description` comments
+- [ ] Register as console_script entry point in pyproject.toml
+
+### Step 5.4 — Tests
+
+- [ ] Test extractor against SQLite with test schema
+- [ ] Test EAV detector identifies known EAV patterns
+- [ ] Test YAML output is valid and re-parseable by StaticKnowledgeProvider
+
+---
+
+## Phase 6: Integration Testing & Documentation
+
+### Step 6.1 — Integration Test Suite
+
+- [ ] SQLite-based fixture DB with:
+  - 1 wide dimension table (dim_customer)
+  - 1 EAV single_value table (tbl_cx_attr)
+  - 1 EAV typed_values table (tbl_entity_props)
+  - 1 wide fact table (fact_orders)
+  - Realistic sample data (1000+ rows)
+- [ ] Knowledge YAML matching the fixture DB
+- [ ] Test scenarios:
+  - Simple SELECT on wide table
+  - EAV single_value pivot query
+  - EAV typed_values pivot query
+  - Join across wide + EAV tables
+  - Pagination (offset-based)
+  - CSV export
+  - Guardrail enforcement (no INSERT, LIMIT injection)
+  - Schema crawler against the fixture DB
+
+### Step 6.2 — Documentation
+
+- [ ] `README.md`:
+  - Quick start (install, configure, run)
+  - Tool descriptions and example usage
+  - How to write knowledge YAML
+  - How to use the schema crawler
+  - Framework integration examples (Claude, OpenAI)
+- [ ] Inline docstrings on all public classes and methods
+- [ ] `knowledge/README.md` — guide for data teams writing knowledge entries
+
+---
+
+## Phase Summary
+
+| Phase | What | Depends On | Status |
+|-------|------|------------|--------|
+| **0: Scaffolding** | Project structure | — | ✅ Done |
+| **1: Models & Knowledge** | Pydantic models, static YAML provider | Phase 0 | ⬜ Next |
+| **2: SQL Validation** | sqlglot parsing, guardrails | Phase 0 | ⬜ Parallel with 1 |
+| **3: Database Executor** | PostgreSQL + SQLite adapters, pagination, export | Phase 0 | ⬜ Parallel with 1,2 |
+| **4: Skill Entry Point** | Wire together, tool registration, format adapters | Phases 1-3 | ⬜ |
+| **5: Schema Crawler** | CLI to bootstrap knowledge YAML | Phase 1 (models) | ⬜ |
+| **6: Integration & Docs** | End-to-end tests, README | Phases 4-5 | ⬜ |
+
+Phases 1, 2, and 3 are independent and should be worked in parallel.
+Phase 4 integrates them. Phase 5 can start once models are defined.
+Phase 6 finalizes.
 
 ---
 
 ## Key Dependencies (Python Packages)
 
-| Package | Purpose |
-|---------|---------|
-| `pydantic` | Data models, config validation |
-| `sqlglot` | SQL parsing, validation, dialect translation |
-| `pyyaml` | YAML config and knowledge file loading |
-| `chromadb` | Vector DB (optional, for vector provider) |
-| `psycopg[binary]` | PostgreSQL adapter |
-| `asyncpg` | Async PostgreSQL (alternative) |
-| `pytest` | Testing |
-| `ruff` | Linting and formatting |
-| `mypy` | Type checking |
+| Package | Purpose | Required? |
+|---------|---------|-----------|
+| `pydantic>=2.0` | Data models, config validation | Yes |
+| `pyyaml>=6.0` | YAML config and knowledge files | Yes |
+| `sqlglot>=20.0` | SQL parsing, validation, dialect support | Yes |
+| `psycopg[binary]>=3.1` | PostgreSQL adapter | Optional (postgresql extra) |
+| `psycopg_pool>=3.1` | PostgreSQL connection pooling | Optional (postgresql extra) |
+| `chromadb>=0.4` | Vector DB knowledge provider | Optional (vector extra) |
+| `pytest>=8.0` | Testing | Dev |
+| `ruff>=0.4` | Linting and formatting | Dev |
+| `mypy>=1.10` | Type checking | Dev |
 
 ---
 
-## Open Questions
+## Resolved Questions
 
-1. **Agent framework target** — Should the skill be framework-agnostic, or target
-   a specific framework (Claude tool_use, LangChain, etc.) first?
-2. **Embedding model** — For vector DB provider, which embedding model? Options:
-   OpenAI `text-embedding-3-small`, local model via `sentence-transformers`, or
-   framework-provided embeddings.
-3. **Multi-database** — Should a single skill instance support multiple databases,
-   or one instance per database?
-4. **Knowledge curation workflow** — Should we build a CLI tool for ingesting
-   schema metadata into the knowledge layer, or is manual YAML sufficient for v0.1?
-5. **Result formatting** — Should the skill return raw data and let the agent
-   format it, or provide pre-formatted markdown tables?
+| Question | Resolution |
+|----------|------------|
+| Agent framework target | Framework-agnostic with format adapters (Claude primary) |
+| Multi-database | One instance per database |
+| Knowledge curation | Auto-extract CLI + manual enrichment by data team |
+| Result formatting | Raw data to agent; agent formats. Skill provides CSV export for large results. |
+| Embedding model | Deferred — not needed until vector DB upgrade |

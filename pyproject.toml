@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-postgresql = ["psycopg[binary]>=3.1"]
+postgresql = ["psycopg[binary]>=3.1", "psycopg_pool>=3.1"]
 vector = ["chromadb>=0.4"]
 all = ["domain-db-skills[postgresql,vector]"]
 dev = [
@@ -23,6 +23,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+
+[project.scripts]
+db-skill = "db_skill.crawler.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/db_skill"]

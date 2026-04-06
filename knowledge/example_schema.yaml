@@ -1,8 +1,14 @@
-# Example knowledge base for a customer data warehouse
+# Example knowledge base for a customer data warehouse.
 # Copy and adapt this for your own database schema.
+#
+# The schema crawler (db-skill crawl) can auto-generate the skeleton;
+# the data team then fills in descriptions, coded_values, and query patterns.
 
-# --- Tables ---
+# ============================================================
+# TABLES
+# ============================================================
 
+# --- Wide table: Customer Dimension ---
 - object_type: table
   database: warehouse
   schema: dbo
@@ -12,8 +18,10 @@
     Master customer table. One row per customer. Contains basic customer
     info like name and email. Primary key is 'id'.
   storage_format: wide
+  row_estimate: 5_000_000
   tags: [customer, dimension]
 
+# --- EAV table (single_value variant): Customer Attributes ---
 - object_type: table
   database: warehouse
   schema: dbo
@@ -25,12 +33,50 @@
     aggregation (CASE WHEN) or self-joins to pivot into wide format.
     Join to dim_customer on cust_id = dim_customer.id.
   storage_format: eav
+  row_estimate: 50_000_000
   eav_config:
+    variant: single_value
     entity_column: cust_id
     attribute_column: attr_cd
-    value_column: attr_val
+    value_columns:
+      - name: attr_val
+        type: varchar(500)
+        description: >
+          The value for the attribute. Always stored as varchar.
+          Cast as needed for numeric or date operations.
   tags: [customer, attributes, eav]
 
+# --- EAV table (typed_values variant): Entity Properties ---
+- object_type: table
+  database: warehouse
+  schema: dbo
+  table: tbl_entity_props
+  display_name: Entity Properties (typed EAV)
+  description: >
+    EAV table with separate typed value columns. Each row stores one
+    property for one entity. The val_type column indicates which value
+    column to read. More efficient than single_value for numeric
+    operations since no casting is needed.
+  storage_format: eav
+  row_estimate: 200_000_000
+  eav_config:
+    variant: typed_values
+    entity_column: entity_id
+    attribute_column: prop_key
+    value_columns:
+      - name: val_str
+        type: varchar(1000)
+        description: "String property values"
+      - name: val_num
+        type: numeric(18,4)
+        description: "Numeric property values"
+      - name: val_dt
+        type: timestamp
+        description: "Date/time property values"
+    type_discriminator: val_type
+  tags: [entity, properties, eav, typed]
+
+# --- Wide table: Orders Fact ---
 - object_type: table
   database: warehouse
   schema: dbo
@@ -40,11 +86,17 @@
     Transactional orders table. One row per order line. Contains order
     date (ord_dt), product code (prod_cd), quantity (qty), and revenue
     (rev_amt). Foreign key cust_id references dim_customer.id.
+    Partitioned by ord_dt (monthly).
   storage_format: wide
+  row_estimate: 1_000_000_000
+  partition_key: ord_dt
   tags: [orders, fact, transactional]
 
-# --- Columns ---
+# ============================================================
+# COLUMNS
+# ============================================================
 
+# --- dim_customer columns ---
 - object_type: column
   database: warehouse
   schema: dbo
@@ -66,11 +118,31 @@
 - object_type: column
   database: warehouse
   schema: dbo
+  table: dim_customer
+  column: email
+  display_name: Email Address
+  description: "Customer email. May be null for legacy records."
+  data_type: varchar(255)
+
+# --- tbl_cx_attr columns ---
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_cx_attr
+  column: cust_id
+  display_name: Customer ID (FK)
+  description: "Foreign key to dim_customer.id."
+  data_type: integer
+
+- object_type: column
+  database: warehouse
+  schema: dbo
   table: tbl_cx_attr
   column: attr_cd
   display_name: Attribute Code
   description: >
-    Coded attribute name. Known values listed below.
+    Coded attribute name. See coded_values for known attribute codes
+    and their meanings.
   data_type: varchar(50)
   coded_values:
     REGION: "Geographic sales region (East, West, Central, South)"
@@ -90,14 +162,81 @@
     varchar — cast as needed for numeric or date operations.
   data_type: varchar(500)
 
+# --- tbl_entity_props columns ---
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_entity_props
+  column: entity_id
+  display_name: Entity ID (FK)
+  description: "Foreign key to the parent entity."
+  data_type: bigint
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_entity_props
+  column: prop_key
+  display_name: Property Key
+  description: "Name of the property."
+  data_type: varchar(100)
+  coded_values:
+    score: "Numeric score (use val_num)"
+    status: "Status label (use val_str): active, inactive, pending"
+    created_at: "Creation timestamp (use val_dt)"
+    category: "Category label (use val_str)"
+    weight: "Weight in kg (use val_num)"
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: tbl_entity_props
+  column: val_type
+  display_name: Value Type Discriminator
+  description: >
+    Indicates which value column to read: 'str', 'num', or 'dt'.
+  data_type: varchar(10)
+  coded_values:
+    str: "Read from val_str"
+    num: "Read from val_num"
+    dt: "Read from val_dt"
+
+# --- fact_orders columns ---
 - object_type: column
   database: warehouse
   schema: dbo
   table: fact_orders
   column: ord_dt
   display_name: Order Date
-  description: "Date the order was placed. Format: DATE (YYYY-MM-DD)."
+  description: "Date the order was placed. Format: DATE (YYYY-MM-DD). Partition key."
   data_type: date
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: cust_id
+  display_name: Customer ID (FK)
+  description: "Foreign key to dim_customer.id."
+  data_type: integer
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: prod_cd
+  display_name: Product Code
+  description: "Product identifier code."
+  data_type: varchar(50)
+
+- object_type: column
+  database: warehouse
+  schema: dbo
+  table: fact_orders
+  column: qty
+  display_name: Quantity
+  description: "Number of units ordered."
+  data_type: integer
 
 - object_type: column
   database: warehouse
@@ -108,7 +247,9 @@
   description: "Revenue in USD for this order line."
   data_type: decimal(12,2)
 
-# --- Relationships ---
+# ============================================================
+# RELATIONSHIPS
+# ============================================================
 
 - object_type: relationship
   description: "Customer attributes belong to a customer"
@@ -126,10 +267,55 @@
   to_column: id
   join_type: many-to-one
 
-# --- Query Patterns ---
+# ============================================================
+# PERFORMANCE HINTS
+# ============================================================
+
+- object_type: performance_hint
+  table: tbl_cx_attr
+  description: >
+    50M+ rows. Always filter by attr_cd first — the composite index
+    on (attr_cd, cust_id) makes this very fast. Avoid full table scans.
+    Prefer conditional aggregation over self-joins for pivoting.
+  indexes:
+    - columns: [attr_cd, cust_id]
+      type: btree
+    - columns: [cust_id]
+      type: btree
+  tags: [performance, eav, index]
+
+- object_type: performance_hint
+  table: tbl_entity_props
+  description: >
+    200M+ rows. Index on (prop_key, entity_id). Always filter by
+    prop_key first. For typed queries, also filter by val_type to
+    avoid reading irrelevant value columns.
+  indexes:
+    - columns: [prop_key, entity_id]
+      type: btree
+    - columns: [entity_id]
+      type: btree
+  tags: [performance, eav, index]
+
+- object_type: performance_hint
+  table: fact_orders
+  description: >
+    1B+ rows, partitioned by ord_dt (monthly). Always include an
+    ord_dt range filter to enable partition pruning. Without a date
+    filter, queries will scan all partitions.
+  indexes:
+    - columns: [ord_dt, cust_id]
+      type: btree
+    - columns: [cust_id, ord_dt]
+      type: btree
+  tags: [performance, partition, index]
+
+# ============================================================
+# QUERY PATTERNS
+# ============================================================
 
 - object_type: query_pattern
-  description: "Count of Gold-tier customers by region"
+  description: "Count of Gold-tier customers by region (single_value EAV pivot)"
   sql_template: |
     SELECT
       r.attr_val AS region,
@@ -139,10 +325,10 @@
     WHERE t.attr_cd = 'TIER' AND t.attr_val = 'Gold'
     GROUP BY r.attr_val
     ORDER BY gold_customer_count DESC
-  tags: [customer, tier, region, eav]
+  tags: [customer, tier, region, eav, single_value]
 
 - object_type: query_pattern
-  description: "Total revenue per customer with their tier and region"
+  description: "Total revenue per customer with tier and region (wide + EAV join)"
   sql_template: |
     SELECT
       c.cust_name,
@@ -153,12 +339,13 @@
     JOIN tbl_cx_attr a ON a.cust_id = c.id
     JOIN fact_orders o ON o.cust_id = c.id
     WHERE a.attr_cd IN ('TIER', 'REGION')
+      AND o.ord_dt >= '2024-01-01'   -- always include date filter!
     GROUP BY c.id, c.cust_name
     ORDER BY total_revenue DESC
-  tags: [customer, revenue, tier, region, eav, join]
+  tags: [customer, revenue, tier, region, eav, join, partition]
 
 - object_type: query_pattern
-  description: "Customers acquired in a specific year"
+  description: "Customers acquired in a specific year (EAV date filter)"
   sql_template: |
     SELECT
       c.cust_name,
@@ -169,3 +356,30 @@
       AND a.attr_val LIKE '2024%'
     ORDER BY a.attr_val
   tags: [customer, acquisition, eav]
+
+- object_type: query_pattern
+  description: "Typed EAV pivot: entity score, status, and created date"
+  sql_template: |
+    SELECT
+      p.entity_id,
+      MAX(CASE WHEN p.prop_key = 'score'      THEN p.val_num END) AS score,
+      MAX(CASE WHEN p.prop_key = 'status'     THEN p.val_str END) AS status,
+      MAX(CASE WHEN p.prop_key = 'created_at' THEN p.val_dt  END) AS created_at
+    FROM tbl_entity_props p
+    WHERE p.prop_key IN ('score', 'status', 'created_at')
+    GROUP BY p.entity_id
+  tags: [entity, typed_values, eav, pivot]
+
+- object_type: query_pattern
+  description: "Monthly revenue trend (partition-aware, always filter by date)"
+  sql_template: |
+    SELECT
+      DATE_TRUNC('month', o.ord_dt) AS month,
+      COUNT(*) AS order_count,
+      SUM(o.rev_amt) AS total_revenue
+    FROM fact_orders o
+    WHERE o.ord_dt >= '2024-01-01'
+      AND o.ord_dt < '2025-01-01'
+    GROUP BY DATE_TRUNC('month', o.ord_dt)
+    ORDER BY month
+  tags: [orders, revenue, trend, partition]

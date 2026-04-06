@@ -3,8 +3,12 @@ skill:
   version: "0.1.0"
 
 knowledge:
-  provider: static_asset       # "vector_db" | "static_asset"
+  provider: static_asset       # "static_asset" | "vector_db"
 
+  static_asset:
+    path: ./knowledge/         # directory of YAML files
+
+  # Vector DB settings (future upgrade path)
   vector_db:
     engine: chromadb
     collection: schema_knowledge
@@ -12,23 +16,27 @@ knowledge:
     host: localhost
     port: 8000
 
-  static_asset:
-    path: ./knowledge/
-
 database:
-  engine: postgresql           # postgresql | mysql | sqlserver | sqlite
+  engine: postgresql           # postgresql | sqlite (more adapters later)
   host: localhost
   port: 5432
   database: warehouse
   user: readonly_agent
   password_env: DB_PASSWORD    # reads password from this env var
   connect_timeout: 10
-  query_timeout: 30
+  query_timeout: 60            # higher default for large tables (M-B rows)
+  pool_size: 5
+  use_server_cursor: true      # stream large results via server-side cursor
 
 guardrails:
-  max_row_limit: 10000
+  max_row_limit: 100000
   default_row_limit: 1000
   allowed_statements: [SELECT]
   blocked_tables: []
   allowed_tables: []
   max_query_length: 10000
+  warn_seq_scan_above: 10000000  # warn if EXPLAIN shows seq scan on table > 10M rows
+
+export:
+  directory: ./exports/        # where CSV exports are written
+  max_export_rows: 1000000     # cap on CSV export size
